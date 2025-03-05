@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 // RESP data types
@@ -31,32 +32,57 @@ type RESP struct {
 // Define a KeyValueStore to store Redis data
 type KeyValueStore struct {
 	mu   sync.RWMutex
-	data map[string]string
+	data map[string]valueWithExpiry
 }
 
-// Create a new KeyValueStore
+// valueWithExpiry holds a value and its expiration time
+type valueWithExpiry struct {
+	value    string
+	expireAt time.Time // Zero time means no expiration
+}
+
 func NewKeyValueStore() *KeyValueStore {
 	return &KeyValueStore{
-		data: make(map[string]string),
+		data: make(map[string]valueWithExpiry),
 	}
 }
 
-// Set a key to a value
-func (kv *KeyValueStore) Set(key, value string) {
+func (kv *KeyValueStore) Set(key, value string, expiry time.Duration) {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
-	kv.data[key] = value
+
+	var expireAt time.Time
+	if expiry > 0 {
+		expireAt = time.Now().Add(expiry)
+	}
+
+	kv.data[key] = valueWithExpiry{
+		value:    value,
+		expireAt: expireAt,
+	}
 }
 
-// Get a value by key
 func (kv *KeyValueStore) Get(key string) (string, bool) {
 	kv.mu.RLock()
 	defer kv.mu.RUnlock()
-	value, exists := kv.data[key]
-	return value, exists
+
+	entry, exists := kv.data[key]
+	if !exists {
+		return "", false
+	}
+
+	if !entry.expireAt.IsZero() && time.Now().After(entry.expireAt) {
+		go func() {
+			kv.mu.Lock()
+			delete(kv.data, key)
+			kv.mu.Unlock()
+		}()
+		return "", false
+	}
+
+	return entry.value, true
 }
 
-// Create a global store for the Redis server
 var store = NewKeyValueStore()
 
 func main() {
@@ -258,7 +284,24 @@ func executeCommand(resp RESP) (RESP, error) {
 		key := resp.Elements[1].Str
 		value := resp.Elements[2].Str
 
-		store.Set(key, value)
+		expiry := time.Duration(0)
+
+		for i := 3; i < len(resp.Elements)-1; i++ {
+
+			option := strings.ToUpper(resp.Elements[i].Str)
+			if option == "PX" && i+1 < len(resp.Elements) {
+
+				pxValue := resp.Elements[i+1].Str
+				ms, err := strconv.Atoi(pxValue)
+				if err != nil {
+					return RESP{}, fmt.Errorf("invalid expire time in 'set' command")
+				}
+				expiry = time.Duration(ms) * time.Millisecond
+				break
+			}
+		}
+
+		store.Set(key, value, expiry)
 
 		return RESP{Type: RESP_SIMPLE_STRING, Str: "OK"}, nil
 

@@ -22,11 +22,19 @@ func main() {
 		os.Exit(1)
 	}
 
-	conn, err := l.Accept()
-	if err != nil {
-		fmt.Println("Error accepting connection: ", err.Error())
-		os.Exit(1)
+	for {
+		conn, err := l.Accept()
+		if err != nil {
+			fmt.Println("Error accepting connection: ", err.Error())
+			continue
+		}
+
+		go handleClient(conn)
 	}
+}
+
+func handleClient(conn net.Conn) {
+	defer conn.Close()
 
 	reader := bufio.NewReader(conn)
 
@@ -37,6 +45,7 @@ func main() {
 			break
 		}
 
+		fmt.Println("Received command: ", command)
 		command = strings.TrimSpace(command)
 
 		if strings.ToUpper(command) == "PING" {

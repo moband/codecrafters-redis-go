@@ -8,6 +8,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 // RESP data types
@@ -26,6 +27,37 @@ type RESP struct {
 	Num      int
 	Elements []RESP
 }
+
+// Define a KeyValueStore to store Redis data
+type KeyValueStore struct {
+	mu   sync.RWMutex
+	data map[string]string
+}
+
+// Create a new KeyValueStore
+func NewKeyValueStore() *KeyValueStore {
+	return &KeyValueStore{
+		data: make(map[string]string),
+	}
+}
+
+// Set a key to a value
+func (kv *KeyValueStore) Set(key, value string) {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	kv.data[key] = value
+}
+
+// Get a value by key
+func (kv *KeyValueStore) Get(key string) (string, bool) {
+	kv.mu.RLock()
+	defer kv.mu.RUnlock()
+	value, exists := kv.data[key]
+	return value, exists
+}
+
+// Create a global store for the Redis server
+var store = NewKeyValueStore()
 
 func main() {
 	// You can use print statements as follows for debugging, they'll be visible when running tests.
@@ -218,6 +250,33 @@ func executeCommand(resp RESP) (RESP, error) {
 
 		return resp.Elements[1], nil
 
+	case "SET":
+		if len(resp.Elements) < 3 {
+			return RESP{}, fmt.Errorf("wrong number of arguments for 'set' command")
+		}
+
+		key := resp.Elements[1].Str
+		value := resp.Elements[2].Str
+
+		store.Set(key, value)
+
+		return RESP{Type: RESP_SIMPLE_STRING, Str: "OK"}, nil
+
+	case "GET":
+		if len(resp.Elements) < 2 {
+			return RESP{}, fmt.Errorf("wrong number of arguments for 'get' command")
+		}
+
+		key := resp.Elements[1].Str
+
+		value, exists := store.Get(key)
+
+		if !exists {
+			return RESP{Type: RESP_BULK_STRING, Str: "", Num: -1}, nil
+		}
+
+		return RESP{Type: RESP_BULK_STRING, Str: value}, nil
+
 	default:
 		return RESP{}, fmt.Errorf("unknown command '%s'", commandResp.Str)
 	}
@@ -238,6 +297,11 @@ func sendRESP(conn net.Conn, resp RESP) error {
 		return err
 
 	case RESP_BULK_STRING:
+		if resp.Num == -1 {
+			_, err := conn.Write([]byte("$-1\r\n"))
+			return err
+		}
+
 		_, err := conn.Write([]byte(fmt.Sprintf("$%d\r\n%s\r\n", len(resp.Str), resp.Str)))
 		return err
 

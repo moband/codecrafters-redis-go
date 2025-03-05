@@ -1,9 +1,11 @@
 package main
 
 import (
+	"bufio"
 	"fmt"
 	"net"
 	"os"
+	"strings"
 )
 
 // Ensures gofmt doesn't remove the "net" and "os" imports in stage 1 (feel free to remove this!)
@@ -26,9 +28,23 @@ func main() {
 		os.Exit(1)
 	}
 
-	_, err = conn.Write([]byte("+PONG\r\n"))
-	if err != nil {
-		fmt.Println("Error sending PONG response: ", err.Error())
-		os.Exit(1)
+	reader := bufio.NewReader(conn)
+
+	for {
+		command, err := reader.ReadString('\n')
+		if err != nil {
+			fmt.Println("Error reading from connection: ", err.Error())
+			break
+		}
+
+		command = strings.TrimSpace(command)
+
+		if strings.ToUpper(command) == "PING" {
+			_, err = conn.Write([]byte("+PONG\r\n"))
+			if err != nil {
+				fmt.Println("Error sending PONG response: ", err.Error())
+				break
+			}
+		}
 	}
 }

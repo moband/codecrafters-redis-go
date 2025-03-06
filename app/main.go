@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"flag"
 	"fmt"
 	"io"
 	"net"
@@ -83,11 +84,51 @@ func (kv *KeyValueStore) Get(key string) (string, bool) {
 	return entry.value, true
 }
 
+// Config stores Redis server configuration
+type Config struct {
+	mu         sync.RWMutex
+	dir        string
+	dbfilename string
+}
+
+func (c *Config) Get(param string) (string, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	switch strings.ToLower(param) {
+	case "dir":
+		return c.dir, true
+	case "dbfilename":
+		return c.dbfilename, true
+	default:
+		return "", false
+	}
+
+}
+
+func NewConfig() *Config {
+
+	return &Config{
+		dir:        "./",
+		dbfilename: "dump.rdb",
+	}
+}
+
 var store = NewKeyValueStore()
+var config = NewConfig()
+
+func parseCommandLineArgs() {
+
+	flag.StringVar(&config.dir, "dir", "./", "Directory to store the database files")
+	flag.StringVar(&config.dbfilename, "dbfilename", "dump.rdb", "Name of the database file")
+	flag.Parse()
+}
 
 func main() {
 	// You can use print statements as follows for debugging, they'll be visible when running tests.
 	fmt.Println("Logs from your program will appear here!")
+
+	parseCommandLineArgs()
 
 	l, err := net.Listen("tcp", "0.0.0.0:6379")
 	if err != nil {
@@ -319,6 +360,32 @@ func executeCommand(resp RESP) (RESP, error) {
 		}
 
 		return RESP{Type: RESP_BULK_STRING, Str: value}, nil
+
+	case "CONFIG":
+		if len(resp.Elements) < 3 {
+			return RESP{}, fmt.Errorf("wrong number of arguments for 'config' command")
+		}
+
+		subcommand := strings.ToUpper(resp.Elements[1].Str)
+
+		switch subcommand {
+		case "GET":
+			param := resp.Elements[2].Str
+			value, exists := config.Get(param)
+			if !exists {
+				return RESP{Type: RESP_ARRAY, Elements: []RESP{}}, nil
+			}
+
+			return RESP{
+				Type: RESP_ARRAY,
+				Elements: []RESP{
+					{Type: RESP_BULK_STRING, Str: param},
+					{Type: RESP_BULK_STRING, Str: value},
+				},
+			}, nil
+		}
+
+		return RESP{}, fmt.Errorf("unknown CONFIG subcommand '%s'", subcommand)
 
 	default:
 		return RESP{}, fmt.Errorf("unknown command '%s'", commandResp.Str)

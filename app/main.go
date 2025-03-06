@@ -2,133 +2,31 @@ package main
 
 import (
 	"bufio"
-	"flag"
 	"fmt"
 	"io"
 	"net"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
+
+	"github.com/codecrafters-io/redis-starter-go/app/rdb"
+	"github.com/codecrafters-io/redis-starter-go/app/utils"
 )
 
-// RESP data types
-const (
-	RESP_SIMPLE_STRING = '+'
-	RESP_ERROR         = '-'
-	RESP_INTEGER       = ':'
-	RESP_BULK_STRING   = '$'
-	RESP_ARRAY         = '*'
-)
-
-// RESP represents a Redis protocol value
-type RESP struct {
-	Type     byte
-	Str      string
-	Num      int
-	Elements []RESP
-}
-
-// Define a KeyValueStore to store Redis data
-type KeyValueStore struct {
-	mu   sync.RWMutex
-	data map[string]valueWithExpiry
-}
-
-// valueWithExpiry holds a value and its expiration time
-type valueWithExpiry struct {
-	value    string
-	expireAt time.Time // Zero time means no expiration
-}
-
-func NewKeyValueStore() *KeyValueStore {
-	return &KeyValueStore{
-		data: make(map[string]valueWithExpiry),
-	}
-}
-
-func (kv *KeyValueStore) Set(key, value string, expiry time.Duration) {
-	kv.mu.Lock()
-	defer kv.mu.Unlock()
-
-	var expireAt time.Time
-	if expiry > 0 {
-		expireAt = time.Now().Add(expiry)
-	}
-
-	kv.data[key] = valueWithExpiry{
-		value:    value,
-		expireAt: expireAt,
-	}
-}
-
-func (kv *KeyValueStore) Get(key string) (string, bool) {
-	kv.mu.RLock()
-	defer kv.mu.RUnlock()
-
-	entry, exists := kv.data[key]
-	if !exists {
-		return "", false
-	}
-
-	if !entry.expireAt.IsZero() && time.Now().After(entry.expireAt) {
-		go func() {
-			kv.mu.Lock()
-			delete(kv.data, key)
-			kv.mu.Unlock()
-		}()
-		return "", false
-	}
-
-	return entry.value, true
-}
-
-// Config stores Redis server configuration
-type Config struct {
-	mu         sync.RWMutex
-	dir        string
-	dbfilename string
-}
-
-func (c *Config) Get(param string) (string, bool) {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-
-	switch strings.ToLower(param) {
-	case "dir":
-		return c.dir, true
-	case "dbfilename":
-		return c.dbfilename, true
-	default:
-		return "", false
-	}
-
-}
-
-func NewConfig() *Config {
-
-	return &Config{
-		dir:        "./",
-		dbfilename: "dump.rdb",
-	}
-}
-
-var store = NewKeyValueStore()
+var store = rdb.NewKeyValueStore()
 var config = NewConfig()
-
-func parseCommandLineArgs() {
-
-	flag.StringVar(&config.dir, "dir", "./", "Directory to store the database files")
-	flag.StringVar(&config.dbfilename, "dbfilename", "dump.rdb", "Name of the database file")
-	flag.Parse()
-}
 
 func main() {
 	// You can use print statements as follows for debugging, they'll be visible when running tests.
 	fmt.Println("Logs from your program will appear here!")
 
 	parseCommandLineArgs()
+
+	if err := loadRDBFile(); err != nil {
+		fmt.Printf("Error loading RDB file: %v\n", err)
+	}
 
 	l, err := net.Listen("tcp", "0.0.0.0:6379")
 	if err != nil {
@@ -145,6 +43,34 @@ func main() {
 
 		go handleClient(conn)
 	}
+}
+
+// loadRDBFile loads and parses an RDB file
+func loadRDBFile() error {
+	logger := utils.NewLogger("RDB-Loader")
+	rdbPath := filepath.Join(config.dir, config.dbfilename)
+
+	if _, err := os.Stat(rdbPath); os.IsNotExist(err) {
+		logger.Info("RDB file does not exist, starting with empty database")
+		return nil // Return nil to indicate no error if the file doesn't exist
+	}
+
+	logger.Info("Loading RDB file from: %s", rdbPath)
+	file, err := os.Open(rdbPath)
+	if err != nil {
+		return fmt.Errorf("failed to open RDB file: %v", err)
+	}
+	defer file.Close()
+
+	parser := rdb.NewRDBParser(file, store)
+	err = parser.Parse()
+	if err != nil {
+		logger.Error("Failed to parse RDB file: %v", err)
+		return err
+	}
+
+	logger.Info("Successfully loaded RDB file")
+	return nil
 }
 
 func handleClient(conn net.Conn) {
@@ -176,121 +102,6 @@ func handleClient(conn net.Conn) {
 			break
 		}
 	}
-}
-
-func parseRESP(reader *bufio.Reader) (RESP, error) {
-
-	respType, err := reader.ReadByte()
-	if err != nil {
-		return RESP{}, err
-	}
-
-	switch respType {
-	case RESP_SIMPLE_STRING:
-		str, err := readLine(reader)
-		if err != nil {
-			return RESP{}, err
-		}
-		return RESP{Type: RESP_SIMPLE_STRING, Str: str}, nil
-
-	case RESP_ERROR:
-		str, err := readLine(reader)
-		if err != nil {
-			return RESP{}, err
-		}
-		return RESP{Type: RESP_ERROR, Str: str}, nil
-
-	case RESP_INTEGER:
-		str, err := readLine(reader)
-		if err != nil {
-			return RESP{}, err
-		}
-		num, err := strconv.Atoi(str)
-		if err != nil {
-			return RESP{}, err
-		}
-		return RESP{Type: RESP_INTEGER, Num: num}, nil
-
-	case RESP_BULK_STRING:
-		length, err := readInteger(reader)
-		if err != nil {
-			return RESP{}, err
-		}
-
-		if length == -1 {
-			return RESP{Type: RESP_BULK_STRING, Str: ""}, nil
-		}
-
-		str := make([]byte, length)
-		_, err = io.ReadFull(reader, str)
-		if err != nil {
-			return RESP{}, err
-		}
-
-		_, err = reader.ReadByte() // \r
-		if err != nil {
-			return RESP{}, err
-		}
-		_, err = reader.ReadByte() // \n
-		if err != nil {
-			return RESP{}, err
-		}
-
-		return RESP{Type: RESP_BULK_STRING, Str: string(str)}, nil
-
-	case RESP_ARRAY:
-		count, err := readInteger(reader)
-		if err != nil {
-			return RESP{}, err
-		}
-
-		if count == -1 {
-			return RESP{Type: RESP_ARRAY, Elements: nil}, nil
-		}
-
-		elements := make([]RESP, count)
-		for i := 0; i < count; i++ {
-			element, err := parseRESP(reader)
-			if err != nil {
-				return RESP{}, err
-			}
-			elements[i] = element
-		}
-
-		return RESP{Type: RESP_ARRAY, Elements: elements}, nil
-
-	default:
-
-		line, err := reader.ReadString('\n')
-		if err != nil {
-			return RESP{}, err
-		}
-		cmd := strings.TrimSpace(line)
-
-		return RESP{
-			Type: RESP_ARRAY,
-			Elements: []RESP{
-				{Type: RESP_BULK_STRING, Str: cmd},
-			},
-		}, nil
-	}
-}
-
-func readLine(reader *bufio.Reader) (string, error) {
-	line, err := reader.ReadString('\n')
-	if err != nil {
-		return "", err
-	}
-	return strings.TrimSuffix(line, "\r\n"), nil
-}
-
-func readInteger(reader *bufio.Reader) (int, error) {
-	line, err := readLine(reader)
-	if err != nil {
-		return 0, err
-	}
-
-	return strconv.Atoi(line)
 }
 
 func executeCommand(resp RESP) (RESP, error) {
@@ -387,6 +198,25 @@ func executeCommand(resp RESP) (RESP, error) {
 
 		return RESP{}, fmt.Errorf("unknown CONFIG subcommand '%s'", subcommand)
 
+	case "KEYS":
+		if len(resp.Elements) < 2 {
+			return RESP{}, fmt.Errorf("wrong number of arguments for 'keys' command")
+		}
+
+		pattern := resp.Elements[1].Str
+
+		if pattern != "*" {
+			return RESP{}, fmt.Errorf("only '*' pattern is supported for 'keys' command")
+		}
+
+		keys := store.GetAllKeys()
+		elements := make([]RESP, len(keys))
+		for i, key := range keys {
+			elements[i] = RESP{Type: RESP_BULK_STRING, Str: key}
+		}
+
+		return RESP{Type: RESP_ARRAY, Elements: elements}, nil
+
 	default:
 		return RESP{}, fmt.Errorf("unknown command '%s'", commandResp.Str)
 	}
@@ -433,8 +263,4 @@ func sendRESP(conn net.Conn, resp RESP) error {
 	default:
 		return fmt.Errorf("unknown RESP type: %c", resp.Type)
 	}
-}
-
-func createErrorResp(message string) RESP {
-	return RESP{Type: RESP_ERROR, Str: fmt.Sprintf("ERR %s", message)}
 }

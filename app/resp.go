@@ -206,10 +206,15 @@ func formatREPLCONFPort(port string) string {
 	return buildRESPCommand("REPLCONF", "listening-port", port)
 }
 
-// formatREPLCONFCapa formats a REPLCONF capa command
+// formatREPLCONFCapa formats a REPLCONF capa command with multiple capabilities
 func formatREPLCONFCapa(capabilities ...string) string {
-	args := []string{"REPLCONF", "capa"}
-	args = append(args, capabilities...)
+	// REPLCONF capa <cap1> capa <cap2> ...
+	args := []string{"REPLCONF"}
+
+	for _, cap := range capabilities {
+		args = append(args, "capa", cap)
+	}
+
 	return buildRESPCommand(args...)
 }
 
@@ -223,4 +228,9 @@ func validateRESPCommand(cmd string) string {
 		result += fmt.Sprintf("%02X", b)
 	}
 	return result
+}
+
+// formatPSYNC formats a PSYNC command
+func formatPSYNC(replID string, offset string) string {
+	return buildRESPCommand("PSYNC", replID, offset)
 }

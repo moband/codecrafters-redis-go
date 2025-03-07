@@ -370,6 +370,39 @@ func connectToMaster() {
 	masterAddr := fmt.Sprintf("%s:%s", config.masterHost, config.masterPort)
 	logger.Info("Connecting to master at %s", masterAddr)
 
+	// Connect to the master server
+	conn, err := connectWithRetry(masterAddr, logger)
+	if err != nil {
+		updateReplicationState(false, nil, err)
+		return
+	}
+
+	// Set up connection state
+	updateReplicationState(true, conn, nil)
+	defer func() {
+		conn.Close()
+		updateReplicationState(false, nil, fmt.Errorf("connection closed"))
+	}()
+
+	// Create a buffered reader for the connection
+	reader := bufio.NewReader(conn)
+
+	// Execute the handshake process
+	err = executeHandshake(conn, reader, logger)
+	if err != nil {
+		logger.Error("Replication handshake failed: %v", err)
+		return
+	}
+
+	logger.Info("Replication handshake completed successfully")
+
+	// In a future stage, we'll handle the RDB file and streaming updates
+	// For now, just keep the connection open
+	select {} // Block forever
+}
+
+// connectWithRetry attempts to connect to the master with exponential backoff
+func connectWithRetry(masterAddr string, logger *utils.Logger) (net.Conn, error) {
 	maxRetries := config.maxRetries
 	retryDelay := config.retryDelay
 
@@ -381,7 +414,8 @@ func connectToMaster() {
 		// Establish TCP connection to master
 		conn, err = net.Dial("tcp", masterAddr)
 		if err == nil {
-			break
+			logger.Info("Connected to master")
+			return conn, nil
 		}
 
 		logger.Error("Failed to connect to master (attempt %d/%d): %v",
@@ -397,107 +431,157 @@ func connectToMaster() {
 		}
 	}
 
-	// If we couldn't connect after all retries
-	if err != nil {
-		logger.Error("Failed to connect to master after %d attempts", maxRetries)
-		updateReplicationState(false, nil, err)
-		return
+	return nil, fmt.Errorf("failed to connect after %d attempts", maxRetries)
+}
+
+// executeHandshake performs the three-part replication handshake
+func executeHandshake(conn net.Conn, reader *bufio.Reader, logger *utils.Logger) error {
+	// Step 1: PING-PONG handshake
+	if err := executePingHandshake(conn, reader, logger); err != nil {
+		return fmt.Errorf("PING handshake failed: %v", err)
 	}
 
-	// Update replication state with the new connection
-	updateReplicationState(true, conn, nil)
+	// Step 2: REPLCONF handshake
+	if err := executeReplconfHandshake(conn, reader, logger); err != nil {
+		return fmt.Errorf("REPLCONF handshake failed: %v", err)
+	}
 
-	defer func() {
-		conn.Close()
-		updateReplicationState(false, nil, fmt.Errorf("connection closed"))
-	}()
+	// Step 3: PSYNC handshake
+	if err := executePsyncHandshake(conn, reader, logger); err != nil {
+		return fmt.Errorf("PSYNC handshake failed: %v", err)
+	}
 
-	logger.Info("Connected to master, initiating handshake")
+	// Mark handshake as completed
+	markHandshakeCompleted()
+	return nil
+}
 
-	// Create a buffered reader for the connection
-	reader := bufio.NewReader(conn)
-
-	// Step 1: Send PING command
+// executePingHandshake handles the PING-PONG part of the handshake
+func executePingHandshake(conn net.Conn, reader *bufio.Reader, logger *utils.Logger) error {
 	logger.Info("Step 1: Sending PING to master")
 	pingCmd := buildRESPCommand("PING")
 	logger.Debug("PING command: %s", validateRESPCommand(pingCmd))
-	_, err = conn.Write([]byte(pingCmd))
+
+	_, err := conn.Write([]byte(pingCmd))
 	if err != nil {
-		logger.Error("Failed to send PING to master: %v", err)
-		return
+		return fmt.Errorf("failed to send PING: %v", err)
 	}
 
 	// Read the PING response
 	response, err := parseRESP(reader)
 	if err != nil {
-		logger.Error("Failed to read PING response: %v", err)
-		return
+		return fmt.Errorf("failed to read PING response: %v", err)
 	}
 
 	// Check if the response is PONG (or +PONG)
 	if (response.Type == RESP_SIMPLE_STRING && response.Str == "PONG") ||
 		(response.Type == RESP_BULK_STRING && response.Str == "PONG") {
 		logger.Info("Received PONG from master, handshake step 1 complete")
-	} else {
-		logger.Error("Unexpected response to PING: %v", response)
-		return
+		return nil
 	}
 
+	return fmt.Errorf("unexpected response to PING: %v", response)
+}
+
+// executeReplconfHandshake handles the REPLCONF part of the handshake
+func executeReplconfHandshake(conn net.Conn, reader *bufio.Reader, logger *utils.Logger) error {
 	// Step 2a: Send REPLCONF listening-port
 	logger.Info("Step 2a: Sending REPLCONF listening-port to master")
 	replconfPortCmd := formatREPLCONFPort(config.port)
 	logger.Debug("REPLCONF listening-port command: %s", validateRESPCommand(replconfPortCmd))
-	_, err = conn.Write([]byte(replconfPortCmd))
+
+	_, err := conn.Write([]byte(replconfPortCmd))
 	if err != nil {
-		logger.Error("Failed to send REPLCONF listening-port: %v", err)
-		return
+		return fmt.Errorf("failed to send REPLCONF listening-port: %v", err)
 	}
 
 	// Read the REPLCONF listening-port response
-	response, err = parseRESP(reader)
+	response, err := parseRESP(reader)
 	if err != nil {
-		logger.Error("Failed to read REPLCONF listening-port response: %v", err)
-		return
+		return fmt.Errorf("failed to read REPLCONF listening-port response: %v", err)
 	}
 
 	// Check if the response is OK
-	if response.Type == RESP_SIMPLE_STRING && response.Str == "OK" {
-		logger.Info("Received OK from master, handshake step 2a complete")
-	} else {
-		logger.Error("Unexpected response to REPLCONF listening-port: %v", response)
-		return
+	if response.Type != RESP_SIMPLE_STRING || response.Str != "OK" {
+		return fmt.Errorf("unexpected response to REPLCONF listening-port: %v", response)
 	}
 
-	// Step 2b: Send REPLCONF capa psync2
-	logger.Info("Step 2b: Sending REPLCONF capa psync2 to master")
-	replconfCapaCmd := formatREPLCONFCapa("psync2")
+	logger.Info("Received OK from master, handshake step 2a complete")
+
+	// Step 2b: Send REPLCONF capa
+	logger.Info("Step 2b: Sending REPLCONF capa to master with capabilities: eof, psync2")
+	replconfCapaCmd := formatREPLCONFCapa("eof", "psync2")
 	logger.Debug("REPLCONF capa command: %s", validateRESPCommand(replconfCapaCmd))
+	logger.Debug("Raw command: %s", replconfCapaCmd)
+
 	_, err = conn.Write([]byte(replconfCapaCmd))
 	if err != nil {
-		logger.Error("Failed to send REPLCONF capa psync2: %v", err)
-		return
+		return fmt.Errorf("failed to send REPLCONF capa: %v", err)
 	}
 
 	// Read the REPLCONF capa response
 	response, err = parseRESP(reader)
 	if err != nil {
-		logger.Error("Failed to read REPLCONF capa response: %v", err)
-		return
+		return fmt.Errorf("failed to read REPLCONF capa response: %v", err)
 	}
 
 	// Check if the response is OK
-	if response.Type == RESP_SIMPLE_STRING && response.Str == "OK" {
-		logger.Info("Received OK from master, handshake step 2b complete")
-	} else {
-		logger.Error("Unexpected response to REPLCONF capa: %v", response)
-		return
+	if response.Type != RESP_SIMPLE_STRING || response.Str != "OK" {
+		return fmt.Errorf("unexpected response to REPLCONF capa: %v", response)
 	}
 
-	// Mark handshake as completed (steps 1 and 2)
-	markHandshakeCompleted()
-	logger.Info("Replication handshake steps 1 and 2 completed successfully")
+	logger.Info("Received OK from master, handshake step 2b complete")
+	return nil
+}
 
-	// In the next stage, we'll implement PSYNC (step 3)
-	// For now, keep the connection open
-	select {} // Block forever
+// executePsyncHandshake handles the PSYNC part of the handshake
+func executePsyncHandshake(conn net.Conn, reader *bufio.Reader, logger *utils.Logger) error {
+	// Step 3: Send PSYNC command
+	logger.Info("Step 3: Sending PSYNC ? -1 to master")
+	psyncCmd := formatPSYNC("?", "-1")
+	logger.Debug("PSYNC command: %s", validateRESPCommand(psyncCmd))
+
+	_, err := conn.Write([]byte(psyncCmd))
+	if err != nil {
+		return fmt.Errorf("failed to send PSYNC: %v", err)
+	}
+
+	// Read the PSYNC response
+	response, err := parseRESP(reader)
+	if err != nil {
+		return fmt.Errorf("failed to read PSYNC response: %v", err)
+	}
+
+	// Check if the response is a FULLRESYNC
+	if response.Type == RESP_SIMPLE_STRING && strings.HasPrefix(response.Str, "FULLRESYNC") {
+		// Parse the replication ID and offset from the response
+		// Format: FULLRESYNC <replid> <offset>
+		if err := handleFullResyncResponse(response, logger); err != nil {
+			return err
+		}
+
+		return nil
+	}
+
+	return fmt.Errorf("unexpected response to PSYNC: %v", response)
+}
+
+func handleFullResyncResponse(response RESP, logger *utils.Logger) error {
+
+	parts := strings.Split(response.Str, " ")
+	if len(parts) >= 3 {
+		replID := parts[1]
+		offset := parts[2]
+		logger.Info("Received FULLRESYNC from master: replID=%s, offset=%s", replID, offset)
+
+		// Update replication state
+		replState.mu.Lock()
+		replState.masterReplId = replID
+		replState.masterReplOffset, _ = strconv.ParseInt(offset, 10, 64)
+		replState.mu.Unlock()
+
+		return nil
+	}
+
+	return fmt.Errorf("malformed FULLRESYNC response: %s", response.Str)
 }

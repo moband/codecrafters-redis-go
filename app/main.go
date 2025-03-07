@@ -26,14 +26,18 @@ func main() {
 	parseCommandLineArgs()
 
 	if err := loadRDBFile(); err != nil {
-		logger.Error("Error loading RDB file: %v\n", err)
+		fmt.Printf("Error loading RDB file: %v\n", err)
 	}
 
+	// Print server role
 	if config.role == "slave" {
-		logger.Info("Starting Redis server in replica mode (slave of %s:%s)\n",
+		fmt.Printf("Starting Redis server in replica mode (slave of %s:%s)\n",
 			config.masterHost, config.masterPort)
+
+		// Start connection to master in a goroutine
+		go connectToMaster()
 	} else {
-		logger.Info("Starting Redis server in master mode")
+		fmt.Println("Starting Redis server in master mode")
 	}
 
 	l, err := net.Listen("tcp", fmt.Sprintf("0.0.0.0:%s", config.port))
@@ -277,4 +281,82 @@ func getReplicationInfo() string {
 func getAllInfoSections() string {
 
 	return getReplicationInfo()
+}
+
+// connectToMaster establishes a connection to the master server and begins replication
+func connectToMaster() {
+	if config.role != "slave" {
+		return
+	}
+
+	logger := utils.NewLogger("Replication")
+	masterAddr := fmt.Sprintf("%s:%s", config.masterHost, config.masterPort)
+	logger.Info("Connecting to master at %s", masterAddr)
+
+	retryDelay := config.retryDelay
+	var conn net.Conn
+	var err error
+
+	// Try to connect with retries
+	for retry := 0; retry < config.maxRetries; retry++ {
+		// Establish TCP connection to master
+		conn, err = net.Dial("tcp", masterAddr)
+		if err == nil {
+			break
+		}
+
+		logger.Error("Failed to connect to master (attempt %d/%d): %v",
+			retry+1, config.maxRetries, err)
+
+		if retry < config.maxRetries-1 {
+			logger.Info("Retrying in %v...", retryDelay)
+			time.Sleep(retryDelay)
+			// Exponential backoff (up to a point)
+			if retryDelay < config.maxReconnectDelay {
+				retryDelay *= 2
+			}
+		}
+	}
+
+	if err != nil {
+		logger.Error("Failed to connect to master after %d attempts", config.maxRetries)
+		return
+	}
+
+	defer conn.Close()
+	logger.Info("Connected to master, initiating handshake")
+
+	// Send PING command as first part of handshake
+	pingCmd := buildRESPCommand("PING")
+	_, err = conn.Write([]byte(pingCmd))
+	if err != nil {
+		logger.Error("Failed to send PING to master: %v", err)
+		return
+	}
+
+	logger.Info("Sent PING to master")
+
+	// Read the response
+	reader := bufio.NewReader(conn)
+	response, err := parseRESP(reader)
+	if err != nil {
+		logger.Error("Failed to read PING response: %v", err)
+		return
+	}
+
+	// Check if the response is PONG (or +PONG)
+	if (response.Type == RESP_SIMPLE_STRING && response.Str == "PONG") ||
+		(response.Type == RESP_BULK_STRING && response.Str == "PONG") {
+		logger.Info("Received PONG from master, handshake step 1 complete")
+	} else {
+		logger.Error("Unexpected response to PING: %v", response)
+		return
+	}
+
+	// In a future stage, we would continue with REPLCONF
+	logger.Info("PING-PONG handshake completed")
+
+	// Keep the connection open but don't do anything with it yet
+	// This will be expanded in future stages
+	select {} // Block forever
 }

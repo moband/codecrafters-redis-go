@@ -6,17 +6,21 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"time"
 )
 
 // Config stores Redis server configuration
 type Config struct {
-	mu         sync.RWMutex
-	dir        string
-	dbfilename string
-	port       string
-	role       string
-	masterHost string // Set when role is "slave"
-	masterPort string // Set when role is "slave"
+	mu                sync.RWMutex
+	dir               string
+	dbfilename        string
+	port              string
+	role              string
+	masterHost        string // Set when role is "slave"
+	masterPort        string // Set when role is "slave"
+	maxRetries        int
+	retryDelay        time.Duration
+	maxReconnectDelay time.Duration
 }
 
 func (c *Config) Get(param string) (string, bool) {
@@ -43,10 +47,13 @@ func (c *Config) Get(param string) (string, bool) {
 
 func NewConfig() *Config {
 	return &Config{
-		dir:        "./",
-		dbfilename: "dump.rdb",
-		port:       "6379",
-		role:       "master",
+		dir:               "./",
+		dbfilename:        "dump.rdb",
+		port:              "6379",
+		role:              "master",
+		maxRetries:        3,
+		retryDelay:        1 * time.Second,
+		maxReconnectDelay: 10 * time.Second,
 	}
 }
 

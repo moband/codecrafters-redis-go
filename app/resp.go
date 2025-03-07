@@ -187,3 +187,16 @@ func sendRESP(conn net.Conn, resp RESP) error {
 		return fmt.Errorf("unknown RESP type: %c", resp.Type)
 	}
 }
+
+// buildRESPCommand creates a RESP Array command string from given arguments
+func buildRESPCommand(args ...string) string {
+	// Start with the array length
+	result := fmt.Sprintf("*%d\r\n", len(args))
+
+	// Add each argument as a bulk string
+	for _, arg := range args {
+		result += fmt.Sprintf("$%d\r\n%s\r\n", len(arg), arg)
+	}
+
+	return result
+}

@@ -64,6 +64,9 @@ func main() {
 		logger.Info("Starting Redis server in replica mode (slave of %s:%s)",
 			serverConfig.masterHost, serverConfig.masterPort)
 
+		// Initialize the key-value store in the replication package
+		replication.SetKeyValueStore(kvStore)
+
 		// Start connection to master in a goroutine
 		go func() {
 			err := replication.ConnectToMaster(serverConfig.masterHost, serverConfig.masterPort, serverConfig.port)

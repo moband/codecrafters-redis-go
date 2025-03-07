@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/codecrafters-io/redis-starter-go/app/protocol"
+	"github.com/codecrafters-io/redis-starter-go/app/store"
 )
 
 // SlaveState represents the current state of the slave replication process
@@ -27,6 +28,22 @@ const (
 	// StateReplicating means fully synchronized and receiving updates
 	StateReplicating SlaveState = "replicating"
 )
+
+// Global variable to store access to the key-value store
+var globalKVStore *store.KeyValueStore
+
+// SetKeyValueStore sets the global key-value store reference
+func SetKeyValueStore(kvStore *store.KeyValueStore) {
+	globalKVStore = kvStore
+}
+
+// getKeyValueStore returns the global key-value store
+func getKeyValueStore() (*store.KeyValueStore, error) {
+	if globalKVStore == nil {
+		return nil, fmt.Errorf("key-value store not initialized")
+	}
+	return globalKVStore, nil
+}
 
 // UpdateReplicationState updates the slave replication state
 func UpdateReplicationState(connected bool, conn net.Conn, err error) {
@@ -140,9 +157,60 @@ func ConnectToMaster(masterHost, masterPort, listenPort string) error {
 
 	LogInfo("Replication handshake completed successfully")
 
-	// In a future stage, we'll handle the RDB file and streaming updates
-	// For now, just keep the connection open
-	select {} // Block forever
+	// After handshake is completed and RDB file is received,
+	// continuously read and process propagated commands from the master
+	// without sending responses back
+
+	// Set up a dedicated store for processing commands
+	kvStore, err := getKeyValueStore()
+	if err != nil {
+		LogError("Failed to get key-value store: %v", err)
+		return fmt.Errorf("failed to get key-value store: %w", err)
+	}
+
+	LogInfo("Starting to process propagated commands from master")
+
+	// Mark the handshake as completed to update the replication state
+	MarkHandshakeCompleted()
+
+	// Process commands from the master
+	for {
+		// Read and parse the next command from the master
+		respCmd, err := protocol.ParseRESP(reader)
+		if err != nil {
+			if err == io.EOF {
+				LogInfo("Master connection closed")
+				break
+			}
+			LogError("Error parsing propagated command: %v", err)
+			// Don't break on parse errors, try to continue reading
+			continue
+		}
+
+		// Log the command for debugging
+		cmdName := "<unknown>"
+		if respCmd.Type == protocol.RESP_ARRAY && len(respCmd.Elements) > 0 &&
+			respCmd.Elements[0].Type == protocol.RESP_BULK_STRING {
+			cmdName = respCmd.Elements[0].Str
+		}
+
+		LogDebug("Received propagated command from master: %s", cmdName)
+
+		// Skip empty or malformed commands
+		if respCmd.Type != protocol.RESP_ARRAY || len(respCmd.Elements) == 0 {
+			LogWarning("Skipping malformed command from master: %v", respCmd)
+			continue
+		}
+
+		// Process the command but don't send a response back to the master
+		err = processPropagatedCommand(respCmd, kvStore)
+		if err != nil {
+			LogError("Error processing propagated command %s: %v", cmdName, err)
+			// Continue processing commands despite errors
+		}
+	}
+
+	return fmt.Errorf("master connection terminated")
 }
 
 // connectWithRetry attempts to connect to the master with exponential backoff
@@ -298,10 +366,54 @@ func executePsyncHandshake(conn net.Conn, reader *bufio.Reader) error {
 
 	// Check for FULLRESYNC response
 	if response.Type == protocol.RESP_SIMPLE_STRING && strings.HasPrefix(response.Str, "FULLRESYNC") {
-		return handleFullResyncResponse(response.Str)
+		LogInfo("Received FULLRESYNC response from master")
+
+		// Process the FULLRESYNC response
+		err = handleFullResyncResponse(response.Str)
+		if err != nil {
+			return fmt.Errorf("failed to handle FULLRESYNC response: %w", err)
+		}
+
+		// After handling FULLRESYNC, read the RDB file
+		err = receiveRDBFile(reader)
+		if err != nil {
+			return fmt.Errorf("failed to receive RDB file: %w", err)
+		}
+
+		return nil
 	}
 
 	return fmt.Errorf("unexpected response to PSYNC: %v", response)
+}
+
+// receiveRDBFile receives the RDB file from the master
+func receiveRDBFile(reader *bufio.Reader) error {
+	// First, read the RDB file size line: $<length>\r\n
+	sizeData, err := reader.ReadString('\n')
+	if err != nil {
+		return fmt.Errorf("failed to read RDB file size: %w", err)
+	}
+
+	if !strings.HasPrefix(sizeData, "$") {
+		return fmt.Errorf("invalid RDB file size format (expected $ prefix): %s", sizeData)
+	}
+
+	// Parse the size (remove $ and \r\n)
+	sizeStr := strings.TrimSuffix(sizeData[1:], "\r\n")
+	size, err := strconv.ParseInt(sizeStr, 10, 64)
+	if err != nil {
+		return fmt.Errorf("invalid RDB file size: %w", err)
+	}
+
+	LogInfo("Reading RDB file of size %d bytes", size)
+
+	// Read the RDB file content
+	if err := ReadRDBFile(reader, size); err != nil {
+		return fmt.Errorf("failed to read RDB file: %w", err)
+	}
+
+	LogInfo("Successfully read RDB file")
+	return nil
 }
 
 // handleFullResyncResponse processes the FULLRESYNC response from the master
@@ -330,25 +442,121 @@ func handleFullResyncResponse(response string) error {
 
 // ReadRDBFile reads the RDB file sent by the master after a FULLRESYNC
 func ReadRDBFile(reader io.Reader, size int64) error {
-	// In future implementation, this will save the RDB file
+	// In future implementation, this will parse and load the RDB file
 	// For now, just consume the bytes
-	buffer := make([]byte, 8192)
+
+	// Use a reasonable buffer size for reading chunks of data
+	const bufferSize = 4096
+	buffer := make([]byte, bufferSize)
 	remaining := size
 
+	LogInfo("Starting to read RDB file data (size: %d bytes)", size)
+
+	// Read the file in chunks until we've consumed all bytes
 	for remaining > 0 {
 		toRead := remaining
 		if toRead > int64(len(buffer)) {
 			toRead = int64(len(buffer))
 		}
 
-		n, err := reader.Read(buffer[:toRead])
+		n, err := io.ReadFull(reader, buffer[:toRead])
 		if err != nil {
+			if err == io.EOF || err == io.ErrUnexpectedEOF {
+				remaining -= int64(n)
+				LogWarning("Received EOF while reading RDB data (read: %d, remaining: %d)", n, remaining)
+				if remaining > 0 {
+					return fmt.Errorf("incomplete RDB file: %d bytes remaining", remaining)
+				}
+				break
+			}
 			return fmt.Errorf("error reading RDB data: %w", err)
 		}
 
 		remaining -= int64(n)
+		if remaining%int64(bufferSize) == 0 || remaining < int64(bufferSize) {
+			LogDebug("Read %d bytes of RDB data, %d remaining", n, remaining)
+		}
 	}
 
-	LogInfo("Received %d bytes of RDB data", size)
+	LogInfo("Successfully read all %d bytes of RDB data", size)
+	return nil
+}
+
+// processPropagatedCommand executes a command received from the master
+// without sending a response back
+func processPropagatedCommand(resp protocol.RESP, kvStore *store.KeyValueStore) error {
+	if resp.Type != protocol.RESP_ARRAY || len(resp.Elements) == 0 {
+		return fmt.Errorf("invalid command format")
+	}
+
+	commandResp := resp.Elements[0]
+	if commandResp.Type != protocol.RESP_BULK_STRING {
+		return fmt.Errorf("command must be a bulk string")
+	}
+
+	command := strings.ToUpper(commandResp.Str)
+	LogDebug("Processing propagated command: %s with %d arguments", command, len(resp.Elements)-1)
+
+	// Process different types of commands
+	switch command {
+	case "SET":
+		return handleSetCommand(resp, kvStore)
+
+	case "DEL":
+		return handleDelCommand(resp, kvStore)
+
+	// Add more command handlers as needed for INCR, LPUSH, etc.
+
+	default:
+		// For this challenge, we'll handle unknown commands gracefully
+		LogDebug("Unknown command received from master: %s (ignoring)", command)
+		return nil // Don't return error for unknown commands
+	}
+}
+
+// handleSetCommand processes a SET command from the master
+func handleSetCommand(resp protocol.RESP, kvStore *store.KeyValueStore) error {
+	if len(resp.Elements) < 3 {
+		return fmt.Errorf("wrong number of arguments for 'set' command")
+	}
+
+	key := resp.Elements[1].Str
+	value := resp.Elements[2].Str
+
+	expiry := time.Duration(0)
+
+	// Check for optional PX argument (expiry in milliseconds)
+	for i := 3; i < len(resp.Elements)-1; i++ {
+		option := strings.ToUpper(resp.Elements[i].Str)
+		if option == "PX" && i+1 < len(resp.Elements) {
+			pxValue := resp.Elements[i+1].Str
+			ms, err := strconv.Atoi(pxValue)
+			if err != nil {
+				return fmt.Errorf("invalid expire time in 'set' command")
+			}
+			expiry = time.Duration(ms) * time.Millisecond
+			break
+		}
+	}
+
+	kvStore.Set(key, value, expiry)
+	LogDebug("Successfully processed SET %s %s", key, value)
+	return nil
+}
+
+// handleDelCommand processes a DEL command from the master
+func handleDelCommand(resp protocol.RESP, kvStore *store.KeyValueStore) error {
+	if len(resp.Elements) < 2 {
+		return fmt.Errorf("wrong number of arguments for 'del' command")
+	}
+
+	// In a real implementation, loop through all keys and delete them
+	// For this challenge, we'll just log the keys
+	keys := make([]string, len(resp.Elements)-1)
+	for i := 1; i < len(resp.Elements); i++ {
+		keys[i-1] = resp.Elements[i].Str
+	}
+
+	LogDebug("DEL command received for keys: %v", keys)
 	return nil
 }

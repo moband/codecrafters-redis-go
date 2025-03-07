@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"fmt"
 	"io"
+	"net"
 	"strconv"
 	"strings"
 )
@@ -142,4 +143,47 @@ func readInteger(reader *bufio.Reader) (int, error) {
 
 func createErrorResp(message string) RESP {
 	return RESP{Type: RESP_ERROR, Str: fmt.Sprintf("ERR %s", message)}
+}
+
+func sendRESP(conn net.Conn, resp RESP) error {
+	switch resp.Type {
+	case RESP_SIMPLE_STRING:
+		_, err := conn.Write([]byte(fmt.Sprintf("+%s\r\n", resp.Str)))
+		return err
+
+	case RESP_ERROR:
+		_, err := conn.Write([]byte(fmt.Sprintf("-%s\r\n", resp.Str)))
+		return err
+
+	case RESP_INTEGER:
+		_, err := conn.Write([]byte(fmt.Sprintf(":%d\r\n", resp.Num)))
+		return err
+
+	case RESP_BULK_STRING:
+		if resp.Num == -1 {
+			_, err := conn.Write([]byte("$-1\r\n"))
+			return err
+		}
+
+		_, err := conn.Write([]byte(fmt.Sprintf("$%d\r\n%s\r\n", len(resp.Str), resp.Str)))
+		return err
+
+	case RESP_ARRAY:
+		_, err := conn.Write([]byte(fmt.Sprintf("*%d\r\n", len(resp.Elements))))
+		if err != nil {
+			return err
+		}
+
+		for _, element := range resp.Elements {
+			err = sendRESP(conn, element)
+			if err != nil {
+				return err
+			}
+		}
+
+		return nil
+
+	default:
+		return fmt.Errorf("unknown RESP type: %c", resp.Type)
+	}
 }

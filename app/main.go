@@ -218,50 +218,45 @@ func executeCommand(resp RESP) (RESP, error) {
 
 		return RESP{Type: RESP_ARRAY, Elements: elements}, nil
 
+	case "INFO":
+		section := ""
+		if len(resp.Elements) > 1 {
+			section = strings.ToLower(resp.Elements[1].Str)
+		}
+
+		var info string
+		if section == "" {
+			info = getAllInfoSections()
+		} else if section == "replication" {
+			info = getReplicationInfo()
+		} else {
+			info = fmt.Sprintf("# %s\n", strings.Title(section))
+		}
+
+		return RESP{Type: RESP_BULK_STRING, Str: info}, nil
+
 	default:
 		return RESP{}, fmt.Errorf("unknown command '%s'", commandResp.Str)
 	}
 }
 
-func sendRESP(conn net.Conn, resp RESP) error {
-	switch resp.Type {
-	case RESP_SIMPLE_STRING:
-		_, err := conn.Write([]byte(fmt.Sprintf("+%s\r\n", resp.Str)))
-		return err
+// Returns information about replication
+func getReplicationInfo() string {
 
-	case RESP_ERROR:
-		_, err := conn.Write([]byte(fmt.Sprintf("-%s\r\n", resp.Str)))
-		return err
+	return "# Replication\n" +
+		"role:master\n" +
+		"connected_slaves:0\n" +
+		"master_replid:8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb\n" +
+		"master_repl_offset:0\n" +
+		"second_repl_offset:-1\n" +
+		"repl_backlog_active:0\n" +
+		"repl_backlog_size:1048576\n" +
+		"repl_backlog_first_byte_offset:0\n" +
+		"repl_backlog_histlen:0"
+}
 
-	case RESP_INTEGER:
-		_, err := conn.Write([]byte(fmt.Sprintf(":%d\r\n", resp.Num)))
-		return err
+// Returns all info sections for the INFO command
+func getAllInfoSections() string {
 
-	case RESP_BULK_STRING:
-		if resp.Num == -1 {
-			_, err := conn.Write([]byte("$-1\r\n"))
-			return err
-		}
-
-		_, err := conn.Write([]byte(fmt.Sprintf("$%d\r\n%s\r\n", len(resp.Str), resp.Str)))
-		return err
-
-	case RESP_ARRAY:
-		_, err := conn.Write([]byte(fmt.Sprintf("*%d\r\n", len(resp.Elements))))
-		if err != nil {
-			return err
-		}
-
-		for _, element := range resp.Elements {
-			err = sendRESP(conn, element)
-			if err != nil {
-				return err
-			}
-		}
-
-		return nil
-
-	default:
-		return fmt.Errorf("unknown RESP type: %c", resp.Type)
-	}
+	return getReplicationInfo()
 }

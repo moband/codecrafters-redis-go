@@ -200,3 +200,27 @@ func buildRESPCommand(args ...string) string {
 
 	return result
 }
+
+// formatREPLCONFPort formats a REPLCONF listening-port command
+func formatREPLCONFPort(port string) string {
+	return buildRESPCommand("REPLCONF", "listening-port", port)
+}
+
+// formatREPLCONFCapa formats a REPLCONF capa command
+func formatREPLCONFCapa(capabilities ...string) string {
+	args := []string{"REPLCONF", "capa"}
+	args = append(args, capabilities...)
+	return buildRESPCommand(args...)
+}
+
+// validateRESPCommand is a debug helper to print the raw bytes of a RESP command
+func validateRESPCommand(cmd string) string {
+	result := ""
+	for i, b := range []byte(cmd) {
+		if i > 0 {
+			result += " "
+		}
+		result += fmt.Sprintf("%02X", b)
+	}
+	return result
+}

@@ -51,7 +51,7 @@ func NewConfig() *Config {
 		dbfilename:        "dump.rdb",
 		port:              "6379",
 		role:              "master",
-		maxRetries:        3,
+		maxRetries:        10,
 		retryDelay:        1 * time.Second,
 		maxReconnectDelay: 10 * time.Second,
 	}

@@ -17,6 +17,7 @@ import (
 
 var store = rdb.NewKeyValueStore()
 var config = NewConfig()
+var logger = utils.NewLogger("RDB-Loader")
 
 func main() {
 	// You can use print statements as follows for debugging, they'll be visible when running tests.
@@ -25,20 +26,27 @@ func main() {
 	parseCommandLineArgs()
 
 	if err := loadRDBFile(); err != nil {
-		fmt.Printf("Error loading RDB file: %v\n", err)
+		logger.Error("Error loading RDB file: %v\n", err)
+	}
+
+	if config.role == "slave" {
+		logger.Info("Starting Redis server in replica mode (slave of %s:%s)\n",
+			config.masterHost, config.masterPort)
+	} else {
+		logger.Info("Starting Redis server in master mode")
 	}
 
 	l, err := net.Listen("tcp", fmt.Sprintf("0.0.0.0:%s", config.port))
 	if err != nil {
-		fmt.Println(fmt.Sprintf("Failed to bind to port %s", config.port))
+		logger.Error(fmt.Sprintf("Failed to bind to port %s", config.port))
 		os.Exit(1)
 	}
-	fmt.Println(fmt.Sprintf("Listening on port %s", config.port))
+	logger.Info(fmt.Sprintf("Listening on port %s", config.port))
 
 	for {
 		conn, err := l.Accept()
 		if err != nil {
-			fmt.Println("Error accepting connection: ", err.Error())
+			logger.Error(fmt.Sprintf("Error accepting connection: %v", err))
 			continue
 		}
 
@@ -48,7 +56,7 @@ func main() {
 
 // loadRDBFile loads and parses an RDB file
 func loadRDBFile() error {
-	logger := utils.NewLogger("RDB-Loader")
+
 	rdbPath := filepath.Join(config.dir, config.dbfilename)
 
 	if _, err := os.Stat(rdbPath); os.IsNotExist(err) {
@@ -240,19 +248,29 @@ func executeCommand(resp RESP) (RESP, error) {
 	}
 }
 
-// Returns information about replication
+// getReplicationInfo returns information about replication
 func getReplicationInfo() string {
+	info := "# Replication\n"
 
-	return "# Replication\n" +
-		"role:master\n" +
-		"connected_slaves:0\n" +
-		"master_replid:8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb\n" +
-		"master_repl_offset:0\n" +
-		"second_repl_offset:-1\n" +
-		"repl_backlog_active:0\n" +
-		"repl_backlog_size:1048576\n" +
-		"repl_backlog_first_byte_offset:0\n" +
-		"repl_backlog_histlen:0"
+	if config.role == "slave" {
+		info += fmt.Sprintf("role:slave\n")
+		info += fmt.Sprintf("master_host:%s\n", config.masterHost)
+		info += fmt.Sprintf("master_port:%s\n", config.masterPort)
+	} else {
+		info += "role:master\n"
+	}
+
+	// Common fields for both roles master and slave
+	info += "connected_slaves:0\n"
+	info += "master_replid:8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb\n"
+	info += "master_repl_offset:0\n"
+	info += "second_repl_offset:-1\n"
+	info += "repl_backlog_active:0\n"
+	info += "repl_backlog_size:1048576\n"
+	info += "repl_backlog_first_byte_offset:0\n"
+	info += "repl_backlog_histlen:0"
+
+	return info
 }
 
 // Returns all info sections for the INFO command

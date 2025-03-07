@@ -24,6 +24,7 @@ var (
 	kvStore        = store.NewKeyValueStore()
 	cmdConfig      commands.Config
 	commandHandler *commands.CommandHandler
+	serverConfig   *ServerConfig
 )
 
 // ServerConfig stores server configuration options
@@ -38,7 +39,7 @@ type ServerConfig struct {
 
 func main() {
 	// Initialize configuration by parsing command line args
-	serverConfig := initConfig()
+	serverConfig = initConfig()
 
 	// Update command configuration from server config
 	cmdConfig = commands.Config{
@@ -191,6 +192,12 @@ func handleClient(conn net.Conn) {
 				break
 			}
 			continue
+		}
+
+		// If we're a master, propagate write commands to replicas
+		if serverConfig.role == "master" {
+			// Propagate the command to all connected replicas
+			replication.PropagateCommand(resp)
 		}
 
 		// Send response

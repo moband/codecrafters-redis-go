@@ -7,6 +7,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/codecrafters-io/redis-starter-go/app/protocol"
 )
 
 // Connection contexts map
@@ -47,12 +49,14 @@ func MarkConnectionAsReplica(conn net.Conn, replicaID string) {
 	if !exists {
 		ctx = &ConnectionContext{
 			Addr: conn.RemoteAddr().String(),
+			Conn: conn,
 		}
 		connectionContexts.m[conn] = ctx
 	}
 
 	ctx.IsReplica = true
 	ctx.ReplicaID = replicaID
+	ctx.Conn = conn
 
 	LogInfo("Marked connection %s as replica %s", ctx.Addr, replicaID)
 }
@@ -269,4 +273,110 @@ func GetMasterReplicationID() string {
 	GlobalMasterState.mu.RLock()
 	defer GlobalMasterState.mu.RUnlock()
 	return GlobalMasterState.masterReplID
+}
+
+// PropagateCommand propagates a command to all connected replicas
+func PropagateCommand(resp protocol.RESP) {
+	// Skip propagation if it's not a write command
+	if !isWriteCommand(resp) {
+		return
+	}
+
+	// Lock the master state to get a consistent snapshot of connected replicas
+	GlobalMasterState.mu.RLock()
+	replicas := make(map[string]*ReplicaInfo, len(GlobalMasterState.replicas))
+	for id, replica := range GlobalMasterState.replicas {
+		replicas[id] = replica
+	}
+	GlobalMasterState.mu.RUnlock()
+
+	// Convert the RESP to a raw byte array (as RESP array)
+	commandBytes := protocol.BuildRESPCommandFromRESP(resp)
+
+	// Send to each replica asynchronously
+	for id := range replicas {
+		// Skip replicas that don't have a connection context
+		ctx := findConnectionContextByReplicaID(id)
+		if ctx == nil || ctx.Conn == nil {
+			continue
+		}
+
+		// Use the replica's connection to send the command
+		conn := ctx.Conn
+		go func(replicaID string, conn net.Conn) {
+			if _, err := conn.Write([]byte(commandBytes)); err != nil {
+				LogError("Failed to propagate command to replica %s: %v", replicaID, err)
+			} else {
+				LogDebug("Propagated command to replica %s: %s", replicaID, commandBytes)
+			}
+		}(id, conn)
+	}
+}
+
+// isWriteCommand determines if a command is a write command that should be propagated
+func isWriteCommand(resp protocol.RESP) bool {
+	if resp.Type != protocol.RESP_ARRAY || len(resp.Elements) == 0 {
+		return false
+	}
+
+	commandResp := resp.Elements[0]
+	if commandResp.Type != protocol.RESP_BULK_STRING {
+		return false
+	}
+
+	// List of write commands that should be propagated
+	command := strings.ToUpper(commandResp.Str)
+	writeCommands := map[string]bool{
+		"SET":              true,
+		"DEL":              true,
+		"SETEX":            true,
+		"PSETEX":           true,
+		"SETNX":            true,
+		"APPEND":           true,
+		"INCR":             true,
+		"DECR":             true,
+		"INCRBY":           true,
+		"DECRBY":           true,
+		"LPUSH":            true,
+		"RPUSH":            true,
+		"LPOP":             true,
+		"RPOP":             true,
+		"LINSERT":          true,
+		"LSET":             true,
+		"LREM":             true,
+		"LTRIM":            true,
+		"HDEL":             true,
+		"HSET":             true,
+		"HSETNX":           true,
+		"HINCRBY":          true,
+		"SADD":             true,
+		"SREM":             true,
+		"SMOVE":            true,
+		"SPOP":             true,
+		"ZADD":             true,
+		"ZREM":             true,
+		"ZINCRBY":          true,
+		"ZREMRANGEBYRANK":  true,
+		"ZREMRANGEBYSCORE": true,
+		"EXPIRE":           true,
+		"EXPIREAT":         true,
+		"PEXPIRE":          true,
+		"PEXPIREAT":        true,
+	}
+
+	return writeCommands[command]
+}
+
+// findConnectionContextByReplicaID finds a connection context by replica ID
+func findConnectionContextByReplicaID(replicaID string) *ConnectionContext {
+	connectionContexts.RLock()
+	defer connectionContexts.RUnlock()
+
+	for _, ctx := range connectionContexts.m {
+		if ctx.IsReplica && ctx.ReplicaID == replicaID {
+			return ctx
+		}
+	}
+
+	return nil
 }

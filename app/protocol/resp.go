@@ -214,3 +214,29 @@ func ValidateRESPCommand(cmd string) string {
 	}
 	return result
 }
+
+// BuildRESPCommandFromRESP creates a RESP array command string from a RESP object
+func BuildRESPCommandFromRESP(resp RESP) string {
+	if resp.Type != RESP_ARRAY {
+		return ""
+	}
+
+	// Start with the array length
+	result := fmt.Sprintf("*%d\r\n", len(resp.Elements))
+
+	// Add each element
+	for _, element := range resp.Elements {
+		switch element.Type {
+		case RESP_BULK_STRING:
+			result += fmt.Sprintf("$%d\r\n%s\r\n", len(element.Str), element.Str)
+		case RESP_INTEGER:
+			numStr := fmt.Sprintf("%d", element.Num)
+			result += fmt.Sprintf("$%d\r\n%s\r\n", len(numStr), numStr)
+		case RESP_SIMPLE_STRING:
+			result += fmt.Sprintf("$%d\r\n%s\r\n", len(element.Str), element.Str)
+			// Add other types as needed
+		}
+	}
+
+	return result
+}

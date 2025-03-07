@@ -52,7 +52,8 @@ var GlobalMasterState = &MasterState{
 
 // ConnectionContext stores context for a client connection
 type ConnectionContext struct {
-	IsReplica bool   // Whether this connection is a replica
-	ReplicaID string // ID of the replica (if IsReplica is true)
-	Addr      string // Remote address of the connection
+	IsReplica bool     // Whether this connection is a replica
+	ReplicaID string   // ID of the replica (if IsReplica is true)
+	Addr      string   // Remote address of the connection
+	Conn      net.Conn // The connection object
 }

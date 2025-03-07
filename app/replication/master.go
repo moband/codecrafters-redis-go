@@ -1,6 +1,7 @@
 package replication
 
 import (
+	"encoding/hex"
 	"fmt"
 	"net"
 	"strings"
@@ -208,8 +209,59 @@ func HandleReplconfCommand(subCommand string, args []string, conn net.Conn) erro
 func HandlePsyncCommand(replID string, offset string, conn net.Conn) error {
 	LogInfo("Handling PSYNC %s %s from replica", replID, offset)
 
-	// For this stage, we just return FULLRESYNC with our replication ID and offset
+	// Mark this connection as a replica
+	ctx := GetConnectionContext(conn)
+	if !ctx.IsReplica {
+		// Generate a new replica ID if not already done
+		replicaID := RegisterReplica(conn.RemoteAddr().String())
+		MarkConnectionAsReplica(conn, replicaID)
+	}
+
+	// After responding with FULLRESYNC in the command handler,
+	// we'll send the RDB file directly to the replica
+	go func() {
+		// Small delay to ensure FULLRESYNC response is sent first
+		time.Sleep(50 * time.Millisecond)
+
+		// Get the RDB file bytes
+		rdbFileBytes := GetEmptyRDBFileBytes()
+
+		// Send the file size followed by the file contents
+		// Format: $<length>\r\n<contents>
+		prefix := fmt.Sprintf("$%d\r\n", len(rdbFileBytes))
+
+		// Send the prefix
+		if _, err := conn.Write([]byte(prefix)); err != nil {
+			LogError("Failed to send RDB file size to replica: %v", err)
+			return
+		}
+
+		// Send the RDB file
+		if _, err := conn.Write(rdbFileBytes); err != nil {
+			LogError("Failed to send RDB file to replica: %v", err)
+			return
+		}
+
+		LogInfo("Successfully sent empty RDB file to replica")
+	}()
+
 	return nil
+}
+
+// GetEmptyRDBFileBytes returns the bytes of an empty RDB file
+func GetEmptyRDBFileBytes() []byte {
+	// Empty RDB file hex representation (provided in the challenge)
+	emptyRDBHex := "524544495330303131fa0972656469732d76657205372e322e30fa0a72656469732d62697473c040fa056374696d65c26d08bc65fa08757365642d6d656dc2b0c41000fa08616f662d62617365c000fff06e3bfec0ff5aa2"
+
+	// Convert hex to bytes
+	bytes := make([]byte, hex.DecodedLen(len(emptyRDBHex)))
+	n, err := hex.Decode(bytes, []byte(emptyRDBHex))
+	if err != nil {
+		LogError("Failed to decode RDB hex: %v", err)
+		return []byte{}
+	}
+
+	return bytes[:n]
 }
 
 // GetMasterReplicationID returns the master's replication ID

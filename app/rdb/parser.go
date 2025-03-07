@@ -5,18 +5,19 @@ import (
 	"io"
 	"strings"
 
+	"github.com/codecrafters-io/redis-starter-go/app/store"
 	"github.com/codecrafters-io/redis-starter-go/app/utils"
 )
 
 // RDBParser encapsulates the RDB file parsing logic
 type RDBParser struct {
-	store  *KeyValueStore
+	store  *store.KeyValueStore
 	reader io.Reader
 	logger *utils.Logger
 }
 
 // NewRDBParser creates a new RDB parser
-func NewRDBParser(reader io.Reader, kvStore *KeyValueStore) *RDBParser {
+func NewRDBParser(reader io.Reader, kvStore *store.KeyValueStore) *RDBParser {
 	return &RDBParser{
 		store:  kvStore,
 		reader: reader,

@@ -1,11 +1,11 @@
-package rdb
+package store
 
 import (
 	"sync"
 	"time"
 )
 
-// Define a KeyValueStore to store Redis data
+// KeyValueStore holds key-value pairs with optional expiration
 type KeyValueStore struct {
 	mu   sync.RWMutex
 	data map[string]valueWithExpiry
@@ -17,12 +17,14 @@ type valueWithExpiry struct {
 	expireAt time.Time // Zero time means no expiration
 }
 
+// NewKeyValueStore creates a new key-value store
 func NewKeyValueStore() *KeyValueStore {
 	return &KeyValueStore{
 		data: make(map[string]valueWithExpiry),
 	}
 }
 
+// Set adds or updates a key-value pair with optional expiration
 func (kv *KeyValueStore) Set(key, value string, expiry time.Duration) {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
@@ -38,6 +40,7 @@ func (kv *KeyValueStore) Set(key, value string, expiry time.Duration) {
 	}
 }
 
+// Get retrieves a value for a key, considering expiration
 func (kv *KeyValueStore) Get(key string) (string, bool) {
 	kv.mu.RLock()
 	defer kv.mu.RUnlock()
@@ -47,18 +50,15 @@ func (kv *KeyValueStore) Get(key string) (string, bool) {
 		return "", false
 	}
 
+	// Check if expired
 	if !entry.expireAt.IsZero() && time.Now().After(entry.expireAt) {
-		go func() {
-			kv.mu.Lock()
-			delete(kv.data, key)
-			kv.mu.Unlock()
-		}()
 		return "", false
 	}
 
 	return entry.value, true
 }
 
+// GetAllKeys returns all non-expired keys
 func (kv *KeyValueStore) GetAllKeys() []string {
 	kv.mu.RLock()
 	defer kv.mu.RUnlock()

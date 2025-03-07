@@ -1,4 +1,4 @@
-package main
+package protocol
 
 import (
 	"bufio"
@@ -26,8 +26,8 @@ type RESP struct {
 	Elements []RESP
 }
 
-func parseRESP(reader *bufio.Reader) (RESP, error) {
-
+// ParseRESP parses a RESP message from a reader
+func ParseRESP(reader *bufio.Reader) (RESP, error) {
 	respType, err := reader.ReadByte()
 	if err != nil {
 		return RESP{}, err
@@ -35,70 +35,57 @@ func parseRESP(reader *bufio.Reader) (RESP, error) {
 
 	switch respType {
 	case RESP_SIMPLE_STRING:
-		str, err := readLine(reader)
+		str, err := ReadLine(reader)
 		if err != nil {
 			return RESP{}, err
 		}
 		return RESP{Type: RESP_SIMPLE_STRING, Str: str}, nil
 
 	case RESP_ERROR:
-		str, err := readLine(reader)
+		str, err := ReadLine(reader)
 		if err != nil {
 			return RESP{}, err
 		}
 		return RESP{Type: RESP_ERROR, Str: str}, nil
 
 	case RESP_INTEGER:
-		str, err := readLine(reader)
-		if err != nil {
-			return RESP{}, err
-		}
-		num, err := strconv.Atoi(str)
+		num, err := ReadInteger(reader)
 		if err != nil {
 			return RESP{}, err
 		}
 		return RESP{Type: RESP_INTEGER, Num: num}, nil
 
 	case RESP_BULK_STRING:
-		length, err := readInteger(reader)
+		size, err := ReadInteger(reader)
 		if err != nil {
 			return RESP{}, err
 		}
 
-		if length == -1 {
-			return RESP{Type: RESP_BULK_STRING, Str: ""}, nil
+		if size == -1 {
+			return RESP{Type: RESP_BULK_STRING, Num: -1}, nil
 		}
 
-		str := make([]byte, length)
-		_, err = io.ReadFull(reader, str)
+		data := make([]byte, size+2) // +2 for CRLF
+		_, err = io.ReadFull(reader, data)
 		if err != nil {
 			return RESP{}, err
 		}
 
-		_, err = reader.ReadByte() // \r
-		if err != nil {
-			return RESP{}, err
-		}
-		_, err = reader.ReadByte() // \n
-		if err != nil {
-			return RESP{}, err
-		}
-
-		return RESP{Type: RESP_BULK_STRING, Str: string(str)}, nil
+		return RESP{Type: RESP_BULK_STRING, Str: string(data[:size])}, nil
 
 	case RESP_ARRAY:
-		count, err := readInteger(reader)
+		count, err := ReadInteger(reader)
 		if err != nil {
 			return RESP{}, err
 		}
 
 		if count == -1 {
-			return RESP{Type: RESP_ARRAY, Elements: nil}, nil
+			return RESP{Type: RESP_ARRAY, Num: -1}, nil
 		}
 
 		elements := make([]RESP, count)
 		for i := 0; i < count; i++ {
-			element, err := parseRESP(reader)
+			element, err := ParseRESP(reader)
 			if err != nil {
 				return RESP{}, err
 			}
@@ -108,23 +95,12 @@ func parseRESP(reader *bufio.Reader) (RESP, error) {
 		return RESP{Type: RESP_ARRAY, Elements: elements}, nil
 
 	default:
-
-		line, err := reader.ReadString('\n')
-		if err != nil {
-			return RESP{}, err
-		}
-		cmd := strings.TrimSpace(line)
-
-		return RESP{
-			Type: RESP_ARRAY,
-			Elements: []RESP{
-				{Type: RESP_BULK_STRING, Str: cmd},
-			},
-		}, nil
+		return RESP{}, fmt.Errorf("unknown RESP type: %c", respType)
 	}
 }
 
-func readLine(reader *bufio.Reader) (string, error) {
+// ReadLine reads a line ending with CRLF
+func ReadLine(reader *bufio.Reader) (string, error) {
 	line, err := reader.ReadString('\n')
 	if err != nil {
 		return "", err
@@ -132,8 +108,9 @@ func readLine(reader *bufio.Reader) (string, error) {
 	return strings.TrimSuffix(line, "\r\n"), nil
 }
 
-func readInteger(reader *bufio.Reader) (int, error) {
-	line, err := readLine(reader)
+// ReadInteger reads an integer followed by CRLF
+func ReadInteger(reader *bufio.Reader) (int, error) {
+	line, err := ReadLine(reader)
 	if err != nil {
 		return 0, err
 	}
@@ -141,11 +118,13 @@ func readInteger(reader *bufio.Reader) (int, error) {
 	return strconv.Atoi(line)
 }
 
-func createErrorResp(message string) RESP {
+// CreateErrorResp creates an error RESP
+func CreateErrorResp(message string) RESP {
 	return RESP{Type: RESP_ERROR, Str: fmt.Sprintf("ERR %s", message)}
 }
 
-func sendRESP(conn net.Conn, resp RESP) error {
+// SendRESP writes a RESP to a connection
+func SendRESP(conn net.Conn, resp RESP) error {
 	switch resp.Type {
 	case RESP_SIMPLE_STRING:
 		_, err := conn.Write([]byte(fmt.Sprintf("+%s\r\n", resp.Str)))
@@ -175,7 +154,7 @@ func sendRESP(conn net.Conn, resp RESP) error {
 		}
 
 		for _, element := range resp.Elements {
-			err = sendRESP(conn, element)
+			err = SendRESP(conn, element)
 			if err != nil {
 				return err
 			}
@@ -188,8 +167,8 @@ func sendRESP(conn net.Conn, resp RESP) error {
 	}
 }
 
-// buildRESPCommand creates a RESP Array command string from given arguments
-func buildRESPCommand(args ...string) string {
+// BuildRESPCommand creates a RESP array command string from given arguments
+func BuildRESPCommand(args ...string) string {
 	// Start with the array length
 	result := fmt.Sprintf("*%d\r\n", len(args))
 
@@ -201,13 +180,14 @@ func buildRESPCommand(args ...string) string {
 	return result
 }
 
-// formatREPLCONFPort formats a REPLCONF listening-port command
-func formatREPLCONFPort(port string) string {
-	return buildRESPCommand("REPLCONF", "listening-port", port)
+// FormatREPLCONFPort formats a REPLCONF listening-port command
+func FormatREPLCONFPort(port string) string {
+	return BuildRESPCommand("REPLCONF", "listening-port", port)
 }
 
-// formatREPLCONFCapa formats a REPLCONF capa command with multiple capabilities
-func formatREPLCONFCapa(capabilities ...string) string {
+// FormatREPLCONFCapa formats a REPLCONF capa command with multiple capabilities
+func FormatREPLCONFCapa(capabilities ...string) string {
+	// Build command with each capability as a separate argument:
 	// REPLCONF capa <cap1> capa <cap2> ...
 	args := []string{"REPLCONF"}
 
@@ -215,11 +195,16 @@ func formatREPLCONFCapa(capabilities ...string) string {
 		args = append(args, "capa", cap)
 	}
 
-	return buildRESPCommand(args...)
+	return BuildRESPCommand(args...)
 }
 
-// validateRESPCommand is a debug helper to print the raw bytes of a RESP command
-func validateRESPCommand(cmd string) string {
+// FormatPSYNC formats a PSYNC command
+func FormatPSYNC(replID string, offset string) string {
+	return BuildRESPCommand("PSYNC", replID, offset)
+}
+
+// ValidateRESPCommand is a debug helper to print the raw bytes of a RESP command
+func ValidateRESPCommand(cmd string) string {
 	result := ""
 	for i, b := range []byte(cmd) {
 		if i > 0 {
@@ -228,9 +213,4 @@ func validateRESPCommand(cmd string) string {
 		result += fmt.Sprintf("%02X", b)
 	}
 	return result
-}
-
-// formatPSYNC formats a PSYNC command
-func formatPSYNC(replID string, offset string) string {
-	return buildRESPCommand("PSYNC", replID, offset)
 }

@@ -28,11 +28,12 @@ func main() {
 		fmt.Printf("Error loading RDB file: %v\n", err)
 	}
 
-	l, err := net.Listen("tcp", "0.0.0.0:6379")
+	l, err := net.Listen("tcp", fmt.Sprintf("0.0.0.0:%s", config.port))
 	if err != nil {
-		fmt.Println("Failed to bind to port 6379")
+		fmt.Println(fmt.Sprintf("Failed to bind to port %s", config.port))
 		os.Exit(1)
 	}
+	fmt.Println(fmt.Sprintf("Listening on port %s", config.port))
 
 	for {
 		conn, err := l.Accept()

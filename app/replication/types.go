@@ -18,6 +18,7 @@ type ReplicationState struct {
 	connected          bool
 	lastError          error
 	lastPingTime       time.Time
+	processedBytes     int64 // Tracks the number of bytes of commands processed
 }
 
 // GlobalReplicationState is the global replication state for a slave

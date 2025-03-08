@@ -1,3 +1,28 @@
+// Package replication implements Redis replication functionality
+//
+// This file contains the implementation of the slave (replica) side of replication.
+// It handles:
+//   1. Connection to a master server
+//   2. Replication handshake (PING, REPLCONF, PSYNC)
+//   3. RDB file transfer
+//   4. Command propagation and execution
+//   5. ACK responses for offset tracking
+//
+// Replication Protocol Flow:
+//   1. Slave connects to master
+//   2. Handshake sequence:
+//      - Slave sends PING, master replies with PONG
+//      - Slave sends REPLCONF with capabilities, master replies with OK
+//      - Slave sends PSYNC with replication ID and offset, master replies with FULLRESYNC
+//   3. Master sends RDB file (snapshot of current state)
+//   4. Master propagates write commands to slave
+//   5. Master periodically sends REPLCONF GETACK, slave responds with current offset
+//
+// Offset Tracking:
+//   - Slave tracks the number of bytes of commands processed
+//   - When master sends REPLCONF GETACK, slave responds with REPLCONF ACK <offset>
+//   - This allows master to know how much data the slave has processed
+
 package replication
 
 import (
@@ -121,6 +146,27 @@ func GetReplicationInfoSlave(masterHost, masterPort string) string {
 
 // ConnectToMaster establishes a connection to the master server and performs replication handshake
 func ConnectToMaster(masterHost, masterPort, listenPort string) error {
+	// Initialize connection to master
+	conn, reader, err := initializeMasterConnection(masterHost, masterPort)
+	if err != nil {
+		return err
+	}
+	defer closeConnection(conn)
+
+	// Execute the handshake process
+	if err := executeHandshake(conn, reader, listenPort); err != nil {
+		LogError("Replication handshake failed: %v", err)
+		return fmt.Errorf("handshake failed: %w", err)
+	}
+
+	LogInfo("Replication handshake completed successfully")
+
+	// Start command processing loop
+	return processCommandLoop(conn, reader)
+}
+
+// initializeMasterConnection sets up the connection to the master server
+func initializeMasterConnection(masterHost, masterPort string) (net.Conn, *bufio.Reader, error) {
 	// Update state
 	GlobalReplicationState.mu.Lock()
 	GlobalReplicationState.masterHost = masterHost
@@ -134,33 +180,28 @@ func ConnectToMaster(masterHost, masterPort, listenPort string) error {
 	conn, err := connectWithRetry(masterAddr, 10, 1*time.Second, 10*time.Second)
 	if err != nil {
 		UpdateReplicationState(false, nil, err)
-		return fmt.Errorf("failed to connect to master: %w", err)
+		return nil, nil, fmt.Errorf("failed to connect to master: %w", err)
 	}
 
 	// Set up connection state
 	UpdateReplicationState(true, conn, nil)
 
-	defer func() {
-		conn.Close()
-		UpdateReplicationState(false, nil, fmt.Errorf("connection closed"))
-	}()
-
-	// Create a buffered reader for the connection
+	// Create a buffered reader
 	reader := bufio.NewReader(conn)
 
-	// Execute the handshake process
-	err = executeHandshake(conn, reader, listenPort)
-	if err != nil {
-		LogError("Replication handshake failed: %v", err)
-		return fmt.Errorf("handshake failed: %w", err)
+	return conn, reader, nil
+}
+
+// closeConnection properly closes the connection and updates the state
+func closeConnection(conn net.Conn) {
+	if conn != nil {
+		conn.Close()
+		UpdateReplicationState(false, nil, fmt.Errorf("connection closed"))
 	}
+}
 
-	LogInfo("Replication handshake completed successfully")
-
-	// After handshake is completed and RDB file is received,
-	// continuously read and process propagated commands from the master
-	// without sending responses back
-
+// processCommandLoop handles the main command processing loop after successful handshake
+func processCommandLoop(conn net.Conn, reader *bufio.Reader) error {
 	// Set up a dedicated store for processing commands
 	kvStore, err := getKeyValueStore()
 	if err != nil {
@@ -168,49 +209,117 @@ func ConnectToMaster(masterHost, masterPort, listenPort string) error {
 		return fmt.Errorf("failed to get key-value store: %w", err)
 	}
 
-	LogInfo("Starting to process propagated commands from master")
-
 	// Mark the handshake as completed to update the replication state
 	MarkHandshakeCompleted()
 
+	// Reset bytes counter after handshake
+	resetProcessedBytes()
+
+	LogInfo("Starting to process propagated commands from master")
+
 	// Process commands from the master
 	for {
-		// Read and parse the next command from the master
-		respCmd, err := protocol.ParseRESP(reader)
+		command, commandBytes, cmdName, err := readNextCommand(reader)
 		if err != nil {
 			if err == io.EOF {
 				LogInfo("Master connection closed")
-				break
+				return fmt.Errorf("master connection terminated")
 			}
-			LogError("Error parsing propagated command: %v", err)
-			// Don't break on parse errors, try to continue reading
+			LogError("Error parsing command from master: %v", err)
 			continue
 		}
 
-		// Log the command for debugging
-		cmdName := "<unknown>"
-		if respCmd.Type == protocol.RESP_ARRAY && len(respCmd.Elements) > 0 &&
-			respCmd.Elements[0].Type == protocol.RESP_BULK_STRING {
-			cmdName = respCmd.Elements[0].Str
-		}
-
-		LogDebug("Received propagated command from master: %s", cmdName)
-
-		// Skip empty or malformed commands
-		if respCmd.Type != protocol.RESP_ARRAY || len(respCmd.Elements) == 0 {
-			LogWarning("Skipping malformed command from master: %v", respCmd)
-			continue
-		}
-
-		// Process the command but don't send a response back to the master
-		err = processPropagatedCommand(respCmd, kvStore)
-		if err != nil {
-			LogError("Error processing propagated command %s: %v", cmdName, err)
-			// Continue processing commands despite errors
+		// Process the command based on its type
+		if isReplconfGetack(command) {
+			handleReplconfGetackCommand(conn, commandBytes)
+		} else {
+			// For all other commands, increment bytes first, then process
+			IncrementProcessedBytes(commandBytes)
+			processStandardCommand(command, cmdName, kvStore)
 		}
 	}
+}
 
-	return fmt.Errorf("master connection terminated")
+// readNextCommand reads the next command from the reader
+func readNextCommand(reader *bufio.Reader) (protocol.RESP, int64, string, error) {
+	// Read the next command
+	command, err := protocol.ParseRESP(reader)
+	if err != nil {
+		return protocol.RESP{}, 0, "", err
+	}
+
+	// Calculate command size
+	commandBytes := calculateCommandSize(command)
+
+	// Extract command name for logging
+	cmdName := extractCommandName(command)
+
+	LogDebug("Received command from master: %s (%d bytes)", cmdName, commandBytes)
+	return command, commandBytes, cmdName, nil
+}
+
+// extractCommandName gets the name of the command from a RESP object
+func extractCommandName(resp protocol.RESP) string {
+	if resp.Type == protocol.RESP_ARRAY && len(resp.Elements) > 0 &&
+		resp.Elements[0].Type == protocol.RESP_BULK_STRING {
+		return strings.ToUpper(resp.Elements[0].Str)
+	}
+	return "<unknown>"
+}
+
+// isReplconfGetack checks if a command is a REPLCONF GETACK command
+func isReplconfGetack(command protocol.RESP) bool {
+	if command.Type != protocol.RESP_ARRAY || len(command.Elements) < 3 {
+		return false
+	}
+
+	cmdName := extractCommandName(command)
+	return cmdName == "REPLCONF" &&
+		command.Elements[1].Type == protocol.RESP_BULK_STRING &&
+		strings.ToUpper(command.Elements[1].Str) == "GETACK"
+}
+
+// handleReplconfGetackCommand responds to a REPLCONF GETACK command
+func handleReplconfGetackCommand(conn net.Conn, commandBytes int64) {
+	// Get current offset before including this command
+	currentOffset := GetProcessedBytes()
+	LogDebug("Responding to REPLCONF GETACK with offset %d", currentOffset)
+
+	// Build and send REPLCONF ACK response
+	offsetStr := strconv.FormatInt(currentOffset, 10)
+	response := protocol.BuildRESPCommand("REPLCONF", "ACK", offsetStr)
+
+	_, err := conn.Write([]byte(response))
+	if err != nil {
+		LogError("Failed to send REPLCONF ACK response: %v", err)
+	} else {
+		LogDebug("Successfully sent REPLCONF ACK %d to master", currentOffset)
+	}
+
+	// Update the processed bytes to include this GETACK command
+	IncrementProcessedBytes(commandBytes)
+}
+
+// processStandardCommand processes a non-GETACK command
+func processStandardCommand(command protocol.RESP, cmdName string, kvStore *store.KeyValueStore) {
+	if err := processPropagatedCommand(command, kvStore); err != nil {
+		LogError("Error processing command %s: %v", cmdName, err)
+	}
+}
+
+// resetProcessedBytes resets the processed bytes counter to zero
+func resetProcessedBytes() {
+	GlobalReplicationState.mu.Lock()
+	defer GlobalReplicationState.mu.Unlock()
+	GlobalReplicationState.processedBytes = 0
+	LogDebug("Reset processed bytes counter to 0")
+}
+
+// calculateCommandSize calculates the size of a RESP command in bytes
+func calculateCommandSize(resp protocol.RESP) int64 {
+	// Convert the RESP back to its wire format to calculate its size
+	respStr := protocol.BuildRESPCommandFromRESP(resp)
+	return int64(len(respStr))
 }
 
 // connectWithRetry attempts to connect to the master with exponential backoff
@@ -485,34 +594,31 @@ func ReadRDBFile(reader io.Reader, size int64) error {
 // processPropagatedCommand executes a command received from the master
 // without sending a response back
 func processPropagatedCommand(resp protocol.RESP, kvStore *store.KeyValueStore) error {
-	if resp.Type != protocol.RESP_ARRAY || len(resp.Elements) == 0 {
-		return fmt.Errorf("invalid command format")
+	// Validate command format
+	if err := validateCommandFormat(resp); err != nil {
+		return err
 	}
 
-	commandResp := resp.Elements[0]
-	if commandResp.Type != protocol.RESP_BULK_STRING {
-		return fmt.Errorf("command must be a bulk string")
-	}
-
-	command := strings.ToUpper(commandResp.Str)
+	command := strings.ToUpper(resp.Elements[0].Str)
 	LogDebug("Processing propagated command: %s with %d arguments", command, len(resp.Elements)-1)
-
-	// Special handling for REPLCONF GETACK command
-	if command == "REPLCONF" && len(resp.Elements) >= 3 &&
-		resp.Elements[1].Type == protocol.RESP_BULK_STRING &&
-		strings.ToUpper(resp.Elements[1].Str) == "GETACK" {
-		return handleReplconfGetack(resp)
-	}
 
 	// Process different types of commands
 	switch command {
+	case "REPLCONF":
+		// REPLCONF GETACK is handled separately in the main loop
+		return nil
+
+	case "PING":
+		LogDebug("Processing PING command from master (silently)")
+		return nil
+
 	case "SET":
 		return handleSetCommand(resp, kvStore)
 
 	case "DEL":
 		return handleDelCommand(resp, kvStore)
 
-	// Add more command handlers as needed for INCR, LPUSH, etc.
+	// Add more command handlers as needed (INCR, LPUSH, etc.)
 
 	default:
 		// For this challenge, we'll handle unknown commands gracefully
@@ -521,84 +627,90 @@ func processPropagatedCommand(resp protocol.RESP, kvStore *store.KeyValueStore) 
 	}
 }
 
-// handleReplconfGetack handles the REPLCONF GETACK command from the master
-// and sends a response with the current processed offset (hardcoded to 0 for now)
-func handleReplconfGetack(resp protocol.RESP) error {
-	// Get the replication state
-	state := GetReplicationState()
-	if state == nil || !state.connected {
-		return fmt.Errorf("not connected to master")
+// validateCommandFormat validates that a command has the correct RESP format
+func validateCommandFormat(resp protocol.RESP) error {
+	if resp.Type != protocol.RESP_ARRAY {
+		return fmt.Errorf("command must be an array")
 	}
 
-	// Get the connection to the master
-	GlobalReplicationState.mu.RLock()
-	conn := GlobalReplicationState.masterConn
-	GlobalReplicationState.mu.RUnlock()
-
-	if conn == nil {
-		return fmt.Errorf("no connection to master")
+	if len(resp.Elements) == 0 {
+		return fmt.Errorf("command array cannot be empty")
 	}
 
-	// Log that we received the GETACK command
-	LogDebug("Received REPLCONF GETACK command from master, sending ACK with offset 0")
-
-	// Create the response: REPLCONF ACK 0
-	// Format: *3\r\n$8\r\nREPLCONF\r\n$3\r\nACK\r\n$1\r\n0\r\n
-	response := protocol.BuildRESPCommand("REPLCONF", "ACK", "0")
-
-	// Send the response to the master
-	_, err := conn.Write([]byte(response))
-	if err != nil {
-		return fmt.Errorf("failed to send REPLCONF ACK response: %w", err)
+	if resp.Elements[0].Type != protocol.RESP_BULK_STRING {
+		return fmt.Errorf("command name must be a bulk string")
 	}
 
-	LogDebug("Successfully sent REPLCONF ACK 0 to master")
 	return nil
 }
 
 // handleSetCommand processes a SET command from the master
 func handleSetCommand(resp protocol.RESP, kvStore *store.KeyValueStore) error {
+	// Validate SET command has at least key and value arguments
 	if len(resp.Elements) < 3 {
-		return fmt.Errorf("wrong number of arguments for 'set' command")
+		return fmt.Errorf("wrong number of arguments for 'set' command (minimum 2 required)")
 	}
 
 	key := resp.Elements[1].Str
 	value := resp.Elements[2].Str
+	expiry := parseSetExpiry(resp.Elements[3:])
 
+	// Store key-value pair with optional expiry
+	kvStore.Set(key, value, expiry)
+	LogDebug("Successfully processed SET %s %s (expiry: %v)", key, value, expiry)
+	return nil
+}
+
+// parseSetExpiry extracts expiry time from SET command options if present
+func parseSetExpiry(options []protocol.RESP) time.Duration {
 	expiry := time.Duration(0)
 
 	// Check for optional PX argument (expiry in milliseconds)
-	for i := 3; i < len(resp.Elements)-1; i++ {
-		option := strings.ToUpper(resp.Elements[i].Str)
-		if option == "PX" && i+1 < len(resp.Elements) {
-			pxValue := resp.Elements[i+1].Str
-			ms, err := strconv.Atoi(pxValue)
-			if err != nil {
-				return fmt.Errorf("invalid expire time in 'set' command")
+	for i := 0; i < len(options)-1; i++ {
+		if options[i].Type == protocol.RESP_BULK_STRING {
+			option := strings.ToUpper(options[i].Str)
+			if option == "PX" && i+1 < len(options) && options[i+1].Type == protocol.RESP_BULK_STRING {
+				if ms, err := strconv.Atoi(options[i+1].Str); err == nil {
+					expiry = time.Duration(ms) * time.Millisecond
+					break
+				}
 			}
-			expiry = time.Duration(ms) * time.Millisecond
-			break
 		}
 	}
 
-	kvStore.Set(key, value, expiry)
-	LogDebug("Successfully processed SET %s %s", key, value)
-	return nil
+	return expiry
 }
 
 // handleDelCommand processes a DEL command from the master
 func handleDelCommand(resp protocol.RESP, kvStore *store.KeyValueStore) error {
+	// Validate DEL command has at least one key argument
 	if len(resp.Elements) < 2 {
-		return fmt.Errorf("wrong number of arguments for 'del' command")
+		return fmt.Errorf("wrong number of arguments for 'del' command (minimum 1 required)")
 	}
 
-	// In a real implementation, loop through all keys and delete them
-	// For this challenge, we'll just log the keys
+	// Extract keys to delete
 	keys := make([]string, len(resp.Elements)-1)
 	for i := 1; i < len(resp.Elements); i++ {
 		keys[i-1] = resp.Elements[i].Str
 	}
 
-	LogDebug("DEL command received for keys: %v", keys)
+	// In a complete implementation, we would delete the keys here
+	// For the challenge, we just log the deletion
+	LogDebug("Would delete keys: %v", keys)
 	return nil
+}
+
+// IncrementProcessedBytes adds the given number of bytes to the processed bytes count
+func IncrementProcessedBytes(bytes int64) {
+	GlobalReplicationState.mu.Lock()
+	defer GlobalReplicationState.mu.Unlock()
+	GlobalReplicationState.processedBytes += bytes
+	LogDebug("Incremented processed bytes by %d to %d", bytes, GlobalReplicationState.processedBytes)
+}
+
+// GetProcessedBytes returns the current processed bytes count
+func GetProcessedBytes() int64 {
+	GlobalReplicationState.mu.RLock()
+	defer GlobalReplicationState.mu.RUnlock()
+	return GlobalReplicationState.processedBytes
 }

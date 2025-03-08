@@ -297,18 +297,22 @@ func (h *CommandHandler) handlePsyncCommand(resp protocol.RESP, conn net.Conn) (
 }
 
 // handleWaitCommand handles the WAIT command
-// For now, it simply returns 0 since we don't track replicas yet
+// It returns the number of connected replicas, regardless of the requested count
 func (h *CommandHandler) handleWaitCommand(resp protocol.RESP) (protocol.RESP, error) {
 	// Check that the command has the correct number of arguments
 	if len(resp.Elements) < 3 {
 		return protocol.RESP{}, fmt.Errorf("wrong number of arguments for 'wait' command")
 	}
 
-	// In a full implementation, we would:
-	// 1. Parse numReplicas and timeout from arguments
-	// 2. Block until numReplicas have acknowledged all commands or timeout is reached
-	// 3. Return the number of replicas that acknowledged
+	// Parse arguments
+	// numReplicas := resp.Elements[1].Str (not used in this implementation)
+	// timeout := resp.Elements[2].Str (not used in this implementation)
 
-	// For this stage, we simply return 0 immediately
-	return protocol.RESP{Type: protocol.RESP_INTEGER, Num: 0}, nil
+	// In a full implementation, we would:
+	// 1. Block until numReplicas have acknowledged all commands or timeout is reached
+	// 2. Return the number of replicas that acknowledged
+
+	// For this stage, we immediately return the current replica count
+	replicaCount := replication.GetConnectedReplicaCount()
+	return protocol.RESP{Type: protocol.RESP_INTEGER, Num: replicaCount}, nil
 }

@@ -497,6 +497,13 @@ func processPropagatedCommand(resp protocol.RESP, kvStore *store.KeyValueStore) 
 	command := strings.ToUpper(commandResp.Str)
 	LogDebug("Processing propagated command: %s with %d arguments", command, len(resp.Elements)-1)
 
+	// Special handling for REPLCONF GETACK command
+	if command == "REPLCONF" && len(resp.Elements) >= 3 &&
+		resp.Elements[1].Type == protocol.RESP_BULK_STRING &&
+		strings.ToUpper(resp.Elements[1].Str) == "GETACK" {
+		return handleReplconfGetack(resp)
+	}
+
 	// Process different types of commands
 	switch command {
 	case "SET":
@@ -512,6 +519,41 @@ func processPropagatedCommand(resp protocol.RESP, kvStore *store.KeyValueStore) 
 		LogDebug("Unknown command received from master: %s (ignoring)", command)
 		return nil // Don't return error for unknown commands
 	}
+}
+
+// handleReplconfGetack handles the REPLCONF GETACK command from the master
+// and sends a response with the current processed offset (hardcoded to 0 for now)
+func handleReplconfGetack(resp protocol.RESP) error {
+	// Get the replication state
+	state := GetReplicationState()
+	if state == nil || !state.connected {
+		return fmt.Errorf("not connected to master")
+	}
+
+	// Get the connection to the master
+	GlobalReplicationState.mu.RLock()
+	conn := GlobalReplicationState.masterConn
+	GlobalReplicationState.mu.RUnlock()
+
+	if conn == nil {
+		return fmt.Errorf("no connection to master")
+	}
+
+	// Log that we received the GETACK command
+	LogDebug("Received REPLCONF GETACK command from master, sending ACK with offset 0")
+
+	// Create the response: REPLCONF ACK 0
+	// Format: *3\r\n$8\r\nREPLCONF\r\n$3\r\nACK\r\n$1\r\n0\r\n
+	response := protocol.BuildRESPCommand("REPLCONF", "ACK", "0")
+
+	// Send the response to the master
+	_, err := conn.Write([]byte(response))
+	if err != nil {
+		return fmt.Errorf("failed to send REPLCONF ACK response: %w", err)
+	}
+
+	LogDebug("Successfully sent REPLCONF ACK 0 to master")
+	return nil
 }
 
 // handleSetCommand processes a SET command from the master
